@@ -1,254 +1,167 @@
 from flask import Flask, request, jsonify
-from flask_cors import CORS, cross_origin
+from flask_cors import CORS
 import cv2
 import numpy as np
-from ultralytics import YOLO
 import os
 import base64
-import warnings
+import logging
 from datetime import datetime
 
-# ปิด warning ของ PyTorch
-warnings.filterwarnings('ignore')
+# ลด memory usage
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
 
-# สร้าง Flask App
 app = Flask(__name__)
+CORS(app)
 
-# CORS settings ที่ครอบคลุมมากขึ้น
-CORS(app, resources={
-    r"/*": {
-        "origins": "*",
-        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization", "Access-Control-Allow-Origin"],
-        "supports_credentials": True,
-        "expose_headers": ["Content-Type"]
-    }
-})
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# เพิ่ม header ในการตอบกลับทุกครั้ง
-@app.after_request
-def after_request(response):
-    response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,Accept,Origin,X-Requested-With')
-    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
-    response.headers.add('Access-Control-Allow-Credentials', 'true')
-    response.headers.add('Access-Control-Max-Age', '86400')
-    return response
+# Lazy loading สำหรับโมเดล
+model = None
 
-# โหลดโมเดล YOLO
-print("=" * 50)
-print("🔄 กำลังโหลดโมเดล YOLO...")
+def load_model():
+    """โหลดโมเดลเมื่อจำเป็นเท่านั้น"""
+    global model
+    if model is None:
+        logger.info("🔄 Loading YOLO model...")
+        from ultralytics import YOLO
+        try:
+            model = YOLO('model-coin.pt')
+            logger.info("✅ Model loaded successfully!")
+        except Exception as e:
+            logger.error(f"❌ Model loading failed: {e}")
+            raise
+    return model
 
-# ⚠️ เปลี่ยนชื่อไฟล์ตรงนี้ให้ตรงกับไฟล์โมเดลของคุณ
-MODEL_PATH = 'model-coin.pt'
-
-try:
-    # โหลดโมเดลโดยไม่สนใจ warning
-    import torch
-    
-    # ตั้งค่าให้โหลดโมเดลโดยไม่เช็ค weights_only (รองรับ PyTorch ทุกเวอร์ชัน)
-    torch_version = torch.__version__.split('+')[0]
-    print(f"📦 PyTorch version: {torch_version}")
-    
-    # โหลดโมเดล YOLO
-    model = YOLO(MODEL_PATH)
-    
-    print("✅ โหลดโมเดลสำเร็จ!")
-    print(f"📦 ไฟล์โมเดล: {MODEL_PATH}")
-    print(f"📋 Classes: {model.names}")
-except Exception as e:
-    print(f"❌ โหลดโมเดลไม่สำเร็จ: {e}")
-    print(f"⚠️  กรุณาตรวจสอบว่าไฟล์ {MODEL_PATH} อยู่ในโฟลเดอร์เดียวกับ app.py")
-    import traceback
-    traceback.print_exc()
-    exit()
-
-print("=" * 50)
-
-# Route หน้าแรก
 @app.route('/')
 def home():
     return jsonify({
         'status': 'active',
-        'service': 'Coin Detection API',
-        'timestamp': datetime.now().isoformat(),
-        'endpoints': {
-            'detect': 'POST /detect',
-            'health': 'GET /health'
-        },
-        'message': '🪙 Coin Detection API is running!'
+        'message': 'Coin Detection API is running!',
+        'timestamp': datetime.now().isoformat()
     })
 
-# Health check endpoint
 @app.route('/health')
 def health_check():
-    return jsonify({
-        'status': 'healthy',
-        'timestamp': datetime.now().isoformat(),
-        'model_loaded': model is not None,
-        'model_classes': list(model.names.values()) if model else [],
-        'server_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    })
-
-# Route สำหรับ OPTIONS (CORS preflight) - สำคัญ!
-@app.route('/detect', methods=['OPTIONS'])
-@cross_origin()
-def detect_options():
-    return jsonify({'status': 'ok'}), 200
-
-# Route สำหรับตรวจจับเหรียญ
-@app.route('/detect', methods=['POST'])
-@cross_origin()
-def detect_coins():
     try:
-        print("\n" + "=" * 50)
-        print("📥 รับ Request ใหม่")
-        print(f"🕒 เวลา: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        
-        # ตรวจสอบว่ามีไฟล์รูปส่งมาหรือไม่
+        model = load_model()
+        return jsonify({
+            'status': 'healthy',
+            'model_loaded': model is not None,
+            'timestamp': datetime.now().isoformat()
+        })
+    except Exception as e:
+        return jsonify({
+            'status': 'unhealthy',
+            'error': str(e)
+        }), 500
+
+@app.route('/detect', methods=['POST'])
+def detect_coins():
+    start_time = datetime.now()
+    logger.info("📥 Received detection request")
+    
+    try:
+        # ตรวจสอบไฟล์
         if 'image' not in request.files:
-            print("❌ ไม่พบไฟล์รูปภาพใน request")
-            return jsonify({
-                'success': False,
-                'error': 'ไม่พบไฟล์รูปภาพ'
-            }), 400
+            return jsonify({'success': False, 'error': 'No image file'}), 400
         
         file = request.files['image']
-        
         if file.filename == '':
-            print("❌ ไม่ได้เลือกไฟล์")
-            return jsonify({
-                'success': False,
-                'error': 'ไม่ได้เลือกไฟล์'
-            }), 400
-        
-        print(f"📄 ชื่อไฟล์: {file.filename}")
-        print(f"📊 ขนาดไฟล์: {len(file.read())} bytes")
-        
-        # Reset file pointer
+            return jsonify({'success': False, 'error': 'No file selected'}), 400
+
+        # ตรวจสอบขนาดไฟล์ (ไม่เกิน 2MB)
+        file.seek(0, os.SEEK_END)
+        file_size = file.tell()
         file.seek(0)
         
-        # อ่านรูปภาพ
-        print("🔄 กำลังอ่านรูปภาพ...")
+        if file_size > 2 * 1024 * 1024:
+            return jsonify({
+                'success': False, 
+                'error': 'File too large (max 2MB)'
+            }), 400
+
+        logger.info(f"📄 Processing file: {file.filename} ({file_size} bytes)")
+
+        # อ่านและ resize รูปภาพเพื่อลด memory
         img_bytes = file.read()
         img_array = np.frombuffer(img_bytes, np.uint8)
         img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
         
         if img is None:
-            print("❌ ไม่สามารถอ่านรูปภาพได้")
-            return jsonify({
-                'success': False,
-                'error': 'ไม่สามารถอ่านรูปภาพได้ กรุณาตรวจสอบไฟล์'
-            }), 400
+            return jsonify({'success': False, 'error': 'Invalid image file'}), 400
+
+        # Resize image ถ้าใหญ่เกิน (max 1000px)
+        height, width = img.shape[:2]
+        if max(height, width) > 1000:
+            scale = 1000 / max(height, width)
+            new_width = int(width * scale)
+            new_height = int(height * scale)
+            img = cv2.resize(img, (new_width, new_height))
+            logger.info(f"📏 Resized image: {width}x{height} -> {new_width}x{new_height}")
+
+        # โหลดโมเดลและประมวลผล
+        model = load_model()
         
-        print(f"📐 ขนาดรูป: {img.shape}")
+        logger.info("🤖 Running YOLO detection...")
+        results = model(img, conf=0.4, verbose=False)  # ลด confidence เพื่อเพิ่ม speed
         
-        # ประมวลผลด้วย YOLO
-        print("🤖 กำลังประมวลผลด้วย YOLO...")
-        results = model(img, conf=0.5, verbose=False)
-        
-        # ดึงข้อมูลการตรวจจับ
         detections = results[0].boxes
         coin_count = len(detections)
         
-        # นับจำนวนเหรียญแต่ละชนิด
-        coin_types = {
-            '1baht': 0,
-            '5baht': 0,
-            '10baht': 0
-        }
-        
+        # นับเหรียญ
+        coin_types = {'1baht': 0, '5baht': 0, '10baht': 0}
         total_value = 0
         
-        print(f"✅ พบเหรียญทั้งหมด: {coin_count} เหรียญ")
-        
-        if coin_count > 0:
-            print("📊 รายละเอียดเหรียญ:")
+        for box in detections:
+            cls = int(box.cls[0])
+            label = model.names[cls]
             
-            for i, box in enumerate(detections):
-                cls = int(box.cls[0])
-                conf = float(box.conf[0])
-                label = model.names[cls]
-                
-                print(f"   เหรียญที่ {i+1}: {label} (ความมั่นใจ {conf:.2%})")
-                
-                # นับจำนวนและคำนวณมูลค่า
-                if label == "1baht":
-                    coin_types['1baht'] += 1
-                    total_value += 1
-                elif label == "5baht":
-                    coin_types['5baht'] += 1
-                    total_value += 5
-                elif label == "10baht":
-                    coin_types['10baht'] += 1
-                    total_value += 10
-        
-        print(f"💰 มูลค่ารวม: {total_value} บาท")
-        
-        # วาดกรอบบนรูปภาพ
-        img_with_boxes = results[0].plot()
-        
-        # แปลงรูปเป็น base64 เพื่อส่งกลับไป
-        _, buffer = cv2.imencode('.jpg', img_with_boxes, [cv2.IMWRITE_JPEG_QUALITY, 90])
-        img_base64 = base64.b64encode(buffer).decode('utf-8')
-        
-        print("🎉 ส่งผลลัพธ์กลับไปแล้ว")
-        print("=" * 50 + "\n")
-        
-        # ส่งผลลัพธ์กลับ
+            if label == "1baht":
+                coin_types['1baht'] += 1
+                total_value += 1
+            elif label == "5baht":
+                coin_types['5baht'] += 1
+                total_value += 5
+            elif label == "10baht":
+                coin_types['10baht'] += 1
+                total_value += 10
+
+        logger.info(f"✅ Found {coin_count} coins, total value: {total_value} THB")
+
+        # วาด bounding boxes (เฉพาะถ้ามีเหรียญ)
+        if coin_count > 0:
+            img_with_boxes = results[0].plot()
+            _, buffer = cv2.imencode('.jpg', img_with_boxes, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            img_base64 = base64.b64encode(buffer).decode('utf-8')
+        else:
+            # ถ้าไม่พบเหรียญ ส่งรูปเดิมกลับ
+            _, buffer = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            img_base64 = base64.b64encode(buffer).decode('utf-8')
+
+        processing_time = (datetime.now() - start_time).total_seconds()
+        logger.info(f"⏱️ Processing completed in {processing_time:.2f}s")
+
         return jsonify({
             'success': True,
             'total_count': coin_count,
             'total_value': total_value,
-            'coin_details': {
-                '1baht': coin_types['1baht'],
-                '5baht': coin_types['5baht'],
-                '10baht': coin_types['10baht']
-            },
+            'coin_details': coin_types,
             'image_with_boxes': img_base64,
-            'message': f'พบเหรียญทั้งหมด {coin_count} เหรียญ มูลค่ารวม {total_value} บาท',
+            'processing_time': processing_time,
             'timestamp': datetime.now().isoformat()
         })
-    
+        
     except Exception as e:
-        print(f"❌ เกิดข้อผิดพลาด: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        print("=" * 50 + "\n")
+        logger.error(f"❌ Error: {str(e)}")
         return jsonify({
             'success': False,
-            'error': f'เกิดข้อผิดพลาด: {str(e)}',
-            'timestamp': datetime.now().isoformat()
+            'error': f'Processing error: {str(e)}'
         }), 500
 
-# Test endpoint สำหรับตรวจสอบการทำงาน
-@app.route('/test', methods=['GET', 'POST'])
-@cross_origin()
-def test_endpoint():
-    return jsonify({
-        'success': True,
-        'message': '✅ Test endpoint is working!',
-        'timestamp': datetime.now().isoformat(),
-        'method': request.method
-    })
-
-# เริ่มต้น Flask Server
 if __name__ == '__main__':
-    # รับ PORT จาก Environment Variable (สำหรับ Deploy)
     port = int(os.environ.get('PORT', 5000))
-    
-    print("\n" + "🚀" * 25)
-    print("🚀 เริ่มต้น Coin Detection Server")
-    print(f"📍 PORT: {port}")
-    print("🪙 รองรับเหรียญ: 1, 5, 10 บาท")
-    print("🌐 CORS: Enabled for all origins")
-    print("📡 Endpoints:")
-    print("   GET  /          - หน้าแรก")
-    print("   GET  /health    - ตรวจสอบสุขภาพ")
-    print("   POST /detect    - ตรวจจับเหรียญ")
-    print("   GET  /test      - ทดสอบการทำงาน")
-    print("🌐 กด Ctrl+C เพื่อหยุด Server")
-    print("🚀" * 25 + "\n")
-    
-    # debug=False สำหรับ Production
+    logger.info(f"🚀 Starting server on port {port}")
     app.run(debug=False, port=port, host='0.0.0.0')
